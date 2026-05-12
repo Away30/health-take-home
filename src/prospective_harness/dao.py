@@ -20,8 +20,6 @@ class PredictionDAO(Protocol):
 
     def get_prediction(self, prediction_id: PredictionId) -> StoredPrediction | None: ...
 
-    def update_prediction(self, prediction_id: PredictionId, prediction: dict[str, Any]) -> None: ...
-
     def add_outcome(
         self,
         prediction_id: PredictionId,

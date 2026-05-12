@@ -1,12 +1,14 @@
 """Prospective prediction registration and calibration harness."""
 
-from .api import ProspectiveHarness, calibration_report, record_outcome, register_prediction
-from .exceptions import ImmutablePredictionError, PredictionNotFoundError, TemporalOrderingError
+from .api import DEFAULT_MAX_RECORDING_DELAY, ProspectiveHarness, calibration_report, record_outcome, register_prediction
+from .exceptions import DataIntegrityError, ImmutablePredictionError, PredictionNotFoundError, TemporalOrderingError
 from .models import CalibrationBin, CalibrationReport, PredictionId
 
 __all__ = [
     "CalibrationBin",
     "CalibrationReport",
+    "DataIntegrityError",
+    "DEFAULT_MAX_RECORDING_DELAY",
     "ImmutablePredictionError",
     "PredictionId",
     "PredictionNotFoundError",

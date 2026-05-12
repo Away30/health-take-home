@@ -8,12 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import ForeignKey, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
-from .exceptions import ImmutablePredictionError
-from .hashing import canonical_json
+from .exceptions import DataIntegrityError, ImmutablePredictionError
+from .hashing import canonical_json, content_hash
 from .models import PredictionId, PredictionWithOutcome, StoredOutcome, StoredPrediction
 
 
@@ -29,8 +29,8 @@ class PredictionRow(Base):
     dataset_hash: Mapped[str] = mapped_column(String, nullable=False)
     prediction_json: Mapped[str] = mapped_column(Text, nullable=False)
     prediction_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    registered_at: Mapped[str] = mapped_column(String, index=True, nullable=False)
-    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    registered_at_us: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    created_at_us: Mapped[int] = mapped_column(Integer, nullable=False)
 
     outcome: Mapped["OutcomeRow | None"] = relationship(back_populates="prediction", uselist=False)
 
@@ -42,8 +42,8 @@ class OutcomeRow(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     prediction_id: Mapped[str] = mapped_column(ForeignKey("predictions.id"), nullable=False, index=True)
     outcome_json: Mapped[str] = mapped_column(Text, nullable=False)
-    observed_at: Mapped[str] = mapped_column(String, nullable=False)
-    recorded_at: Mapped[str] = mapped_column(String, nullable=False)
+    observed_at_us: Mapped[int] = mapped_column(Integer, nullable=False)
+    recorded_at_us: Mapped[int] = mapped_column(Integer, nullable=False)
 
     prediction: Mapped[PredictionRow] = relationship(back_populates="outcome")
 
@@ -54,23 +54,36 @@ def _to_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _encode_dt(value: datetime) -> str:
-    return _to_utc(value).isoformat().replace("+00:00", "Z")
+def _encode_dt(value: datetime) -> int:
+    return int(_to_utc(value).timestamp() * 1_000_000)
 
 
-def _decode_dt(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+def _decode_dt(value: int) -> datetime:
+    return datetime.fromtimestamp(value / 1_000_000, timezone.utc)
+
+
+def _prediction_payload(row: PredictionRow) -> dict[str, Any]:
+    return json.loads(row.prediction_json)
+
+
+def _verify_prediction_hash(row: PredictionRow) -> dict[str, Any]:
+    prediction = _prediction_payload(row)
+    expected = content_hash({"model_id": row.model_id, "dataset_hash": row.dataset_hash, "prediction": prediction})
+    if row.prediction_hash != expected:
+        raise DataIntegrityError(f"prediction hash mismatch for {row.id}")
+    return prediction
 
 
 def _stored_prediction(row: PredictionRow) -> StoredPrediction:
+    prediction = _verify_prediction_hash(row)
     return StoredPrediction(
         id=PredictionId(row.id),
         model_id=row.model_id,
         dataset_hash=row.dataset_hash,
-        prediction=json.loads(row.prediction_json),
+        prediction=prediction,
         prediction_hash=row.prediction_hash,
-        registered_at=_decode_dt(row.registered_at),
-        created_at=_decode_dt(row.created_at),
+        registered_at=_decode_dt(row.registered_at_us),
+        created_at=_decode_dt(row.created_at_us),
     )
 
 
@@ -78,9 +91,44 @@ def _stored_outcome(row: OutcomeRow) -> StoredOutcome:
     return StoredOutcome(
         prediction_id=PredictionId(row.prediction_id),
         outcome=json.loads(row.outcome_json),
-        observed_at=_decode_dt(row.observed_at),
-        recorded_at=_decode_dt(row.recorded_at),
+        observed_at=_decode_dt(row.observed_at_us),
+        recorded_at=_decode_dt(row.recorded_at_us),
     )
+
+
+def _install_append_only_triggers(connection) -> None:
+    statements = [
+        """
+        CREATE TRIGGER IF NOT EXISTS predictions_no_update
+        BEFORE UPDATE ON predictions
+        BEGIN
+            SELECT RAISE(ABORT, 'predictions are append-only');
+        END;
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS predictions_no_delete
+        BEFORE DELETE ON predictions
+        BEGIN
+            SELECT RAISE(ABORT, 'predictions are append-only');
+        END;
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS outcomes_no_update
+        BEFORE UPDATE ON outcomes
+        BEGIN
+            SELECT RAISE(ABORT, 'outcomes are append-only');
+        END;
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS outcomes_no_delete
+        BEFORE DELETE ON outcomes
+        BEGIN
+            SELECT RAISE(ABORT, 'outcomes are append-only');
+        END;
+        """,
+    ]
+    for statement in statements:
+        connection.execute(text(statement))
 
 
 class SQLitePredictionDAO:
@@ -91,6 +139,8 @@ class SQLitePredictionDAO:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(f"sqlite:///{self.path}", future=True)
         Base.metadata.create_all(self.engine)
+        with self.engine.begin() as connection:
+            _install_append_only_triggers(connection)
         self._sessionmaker = sessionmaker(self.engine, expire_on_commit=False, future=True)
 
     def add_prediction(
@@ -109,8 +159,8 @@ class SQLitePredictionDAO:
             dataset_hash=dataset_hash,
             prediction_json=canonical_json(prediction),
             prediction_hash=prediction_hash,
-            registered_at=_encode_dt(registered_at),
-            created_at=_encode_dt(now),
+            registered_at_us=_encode_dt(registered_at),
+            created_at_us=_encode_dt(now),
         )
         with self._sessionmaker() as session:
             session.add(row)
@@ -122,9 +172,6 @@ class SQLitePredictionDAO:
             row = session.get(PredictionRow, str(prediction_id))
             return _stored_prediction(row) if row else None
 
-    def update_prediction(self, prediction_id: PredictionId, prediction: dict[str, Any]) -> None:
-        raise ImmutablePredictionError("registered predictions are append-only and cannot be updated")
-
     def add_outcome(
         self,
         prediction_id: PredictionId,
@@ -135,8 +182,8 @@ class SQLitePredictionDAO:
         row = OutcomeRow(
             prediction_id=str(prediction_id),
             outcome_json=canonical_json(outcome),
-            observed_at=_encode_dt(observed_at),
-            recorded_at=_encode_dt(recorded_at),
+            observed_at_us=_encode_dt(observed_at),
+            recorded_at_us=_encode_dt(recorded_at),
         )
         with self._sessionmaker() as session:
             session.add(row)
@@ -158,19 +205,20 @@ class SQLitePredictionDAO:
         model_id: str,
         time_window: tuple[datetime, datetime],
     ) -> list[PredictionWithOutcome]:
-        start, end = (_to_utc(time_window[0]), _to_utc(time_window[1]))
+        start_us, end_us = (_encode_dt(time_window[0]), _encode_dt(time_window[1]))
         with self._sessionmaker() as session:
             rows = list(
                 session.scalars(
                     select(PredictionRow)
                     .where(PredictionRow.model_id == model_id)
-                    .order_by(PredictionRow.registered_at, PredictionRow.id)
+                    .where(PredictionRow.registered_at_us >= start_us)
+                    .where(PredictionRow.registered_at_us <= end_us)
+                    .order_by(PredictionRow.registered_at_us, PredictionRow.id)
                 )
             )
             result: list[PredictionWithOutcome] = []
             for row in rows:
                 prediction = _stored_prediction(row)
-                if start <= prediction.registered_at <= end:
-                    outcome = _stored_outcome(row.outcome) if row.outcome else None
-                    result.append(PredictionWithOutcome(prediction=prediction, outcome=outcome))
+                outcome = _stored_outcome(row.outcome) if row.outcome else None
+                result.append(PredictionWithOutcome(prediction=prediction, outcome=outcome))
             return result

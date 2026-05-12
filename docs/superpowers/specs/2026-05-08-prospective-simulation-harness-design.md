@@ -6,7 +6,7 @@ Build a small Python package that lets researchers pre-register binary probabili
 
 ## Scope
 
-The package implements only the README requirements: a Python library with SQLite storage, a swappable DAO boundary, append-only prediction registration, strict prospective outcome recording, calibration metrics, documentation, and pytest coverage. It intentionally does not include a web service, CLI, Docker setup, authentication, or a Postgres implementation because those are not required and would add evaluation risk without improving the core take-home objective.
+The package implements the README requirements: a Python library with SQLite storage, a swappable DAO boundary, append-only prediction registration, strict prospective outcome recording, calibration metrics, documentation, and pytest coverage. A post-review hardening pass adds bounded outcome recording, SQLite append-only triggers, and hash re-verification on read. It intentionally does not include a web service, CLI, Docker setup, authentication, or a Postgres implementation because those are not required and would add evaluation risk without improving the core take-home objective.
 
 ## Public Interface
 
@@ -68,17 +68,18 @@ SQLite uses two append-oriented tables:
 - `observed_at`: caller-provided observation timestamp.
 - `recorded_at`: UTC insertion timestamp.
 
-A unique outcome per prediction preserves the append-only interpretation: predictions cannot be overwritten, and realized outcomes cannot be revised through the public API.
+A unique outcome per prediction preserves the append-only interpretation: predictions cannot be overwritten, and realized outcomes cannot be revised through the public API. SQLite triggers also reject direct UPDATE and DELETE statements on predictions and outcomes.
 
 ## Backfilling Prevention
 
 `record_outcome` loads the registered prediction and compares timestamps. It accepts an outcome only when:
 
 ```python
-observed_at > registered_at
+registered_at < observed_at <= recorded_at
+recorded_at - observed_at <= max_recording_delay
 ```
 
-If `observed_at == registered_at` or `observed_at < registered_at`, the service raises `TemporalOrderingError`. This explicitly distinguishes valid prospective outcomes from contemporaneous or retrospective records and avoids silently accepting backfilled data.
+The default `max_recording_delay` is five minutes. If `observed_at == registered_at`, `observed_at < registered_at`, `observed_at > recorded_at`, or the recording delay exceeds the configured bound, the service raises `TemporalOrderingError`. This explicitly distinguishes valid prospective outcomes from contemporaneous or retrospective records and avoids silently accepting backfilled data.
 
 ## Immutability
 
@@ -86,7 +87,9 @@ Predictions are append-only:
 
 - Registration inserts a new row with canonical JSON and SHA-256 hash.
 - Public API exposes no update operation.
-- The SQLite DAO's update path raises `ImmutablePredictionError` so tests can verify the invariant directly at the storage boundary.
+- The DAO exposes no prediction mutation method.
+- SQLite triggers reject direct database UPDATE and DELETE attempts.
+- Prediction hashes are recomputed on read and mismatches raise `DataIntegrityError`.
 - Duplicate outcome recording raises `ImmutablePredictionError` because revising an outcome would alter the realized record.
 
 ## Calibration Report

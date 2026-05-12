@@ -1,8 +1,14 @@
-"""Public API for registering predictions and reporting calibration."""
+"""Public API for registering predictions and reporting calibration.
+
+The module-level convenience functions lazily create a SQLite database named
+``prospective_harness.sqlite3`` in the caller's current working directory. Use
+``ProspectiveHarness(sqlite_path=...)`` when the database location matters.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +19,8 @@ from .hashing import content_hash
 from .models import CalibrationReport, PredictionId
 from .sqlite_dao import SQLitePredictionDAO
 
+DEFAULT_MAX_RECORDING_DELAY = timedelta(minutes=5)
+
 
 def _to_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
@@ -20,17 +28,35 @@ def _to_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class ProspectiveHarness:
     """Service layer enforcing prospective registration invariants."""
 
-    def __init__(self, dao: PredictionDAO | None = None, sqlite_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        dao: PredictionDAO | None = None,
+        sqlite_path: str | Path | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        max_recording_delay: timedelta = DEFAULT_MAX_RECORDING_DELAY,
+    ) -> None:
         if dao is not None and sqlite_path is not None:
             raise ValueError("provide either dao or sqlite_path, not both")
+        if max_recording_delay < timedelta(0):
+            raise ValueError("max_recording_delay must be non-negative")
         self.dao: PredictionDAO = dao if dao is not None else SQLitePredictionDAO(sqlite_path or "prospective_harness.sqlite3")
+        self._clock = clock or _utc_now
+        self.max_recording_delay = max_recording_delay
+
+    def _now(self) -> datetime:
+        return _to_utc(self._clock())
 
     def register_prediction(self, model_id: str, dataset_hash: str, prediction: dict[str, Any]) -> PredictionId:
         validate_prediction_probability(prediction)
-        registered_at = datetime.now(timezone.utc)
+        registered_at = self._now()
         digest = content_hash({"model_id": model_id, "dataset_hash": dataset_hash, "prediction": prediction})
         return self.dao.add_prediction(model_id, dataset_hash, prediction, digest, registered_at)
 
@@ -39,10 +65,17 @@ class ProspectiveHarness:
         prediction = self.dao.get_prediction(PredictionId(str(prediction_id)))
         if prediction is None:
             raise PredictionNotFoundError(f"prediction not found: {prediction_id}")
+
         observed_at = _to_utc(observed_at)
+        recorded_at = self._now()
         if observed_at <= prediction.registered_at:
             raise TemporalOrderingError("outcome observed_at must be strictly after prediction registration time")
-        self.dao.add_outcome(prediction.id, outcome, observed_at, datetime.now(timezone.utc))
+        if observed_at > recorded_at:
+            raise TemporalOrderingError("outcome observed_at cannot be in the future relative to recorded_at")
+        if recorded_at - observed_at > self.max_recording_delay:
+            raise TemporalOrderingError("outcome recorded too late after observed_at to preserve prospective evidence")
+
+        self.dao.add_outcome(prediction.id, outcome, observed_at, recorded_at)
 
     def calibration_report(self, model_id: str, time_window: tuple[datetime, datetime]) -> CalibrationReport:
         start, end = (_to_utc(time_window[0]), _to_utc(time_window[1]))

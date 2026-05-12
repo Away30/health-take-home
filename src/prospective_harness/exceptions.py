@@ -10,8 +10,12 @@ class ImmutablePredictionError(ProspectiveHarnessError):
 
 
 class TemporalOrderingError(ProspectiveHarnessError):
-    """Raised when an outcome was not observed strictly after registration."""
+    """Raised when an outcome was not observed in the permitted prospective window."""
 
 
 class PredictionNotFoundError(ProspectiveHarnessError):
     """Raised when an operation references an unknown prediction id."""
+
+
+class DataIntegrityError(ProspectiveHarnessError):
+    """Raised when stored prediction data no longer matches its content hash."""
