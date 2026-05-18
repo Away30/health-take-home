@@ -1,13 +1,11 @@
-# Prospective Simulation Harness
+# CureForge Provenance Harness
 
-A small Python package for prospective model evaluation. Researchers can register a model prediction before an outcome is observed, record the outcome in a bounded prospective window, and generate calibration reports.
+A Python package for two related provenance tasks:
 
-The core design goal is to make backfilling materially harder than a simple `observed_at > registered_at` check. The package therefore enforces:
+1. **Task A: Prospective Simulation Harness** - pre-register probabilistic predictions, record outcomes in a bounded prospective window, and produce calibration reports.
+2. **Task B: Tamper-Evident Attestation Library** - wrap arbitrary application records in two independent append-only hash-chain substrates and re-verify provenance on read.
 
-- strict `registered_at < observed_at <= recorded_at` ordering
-- a configurable maximum delay between `observed_at` and `recorded_at` that defaults to 5 minutes
-- SQLite triggers that reject direct `UPDATE` and `DELETE` attempts on prediction and outcome rows
-- SHA-256 content hashes that are recomputed and verified when prediction rows are read
+The implementation is intentionally local and reproducible: SQLite storage, no services required, and runtime dependencies limited to `pydantic`, `sqlalchemy`, and `numpy`.
 
 ## Requirements
 
@@ -27,7 +25,166 @@ python -m pip install -e '.[test]'
 python -m pytest -v
 ```
 
+---
+
+# Task B: Tamper-Evident Attestation Library
+
+## Quick Start
+
+```python
+from prospective_harness import AttestationStore
+
+store = AttestationStore(
+    sqlite_path="attestations.sqlite3",
+    max_write_latency_seconds=1.0,
+)
+
+envelope = store.write({"record_type": "hypothesis", "value": "rapamycin improves marker X"})
+loaded = store.read(envelope.record_id)  # re-verifies both chains before returning
+report_a = store.verify_chain("A")
+report_b = store.verify_chain("B")
+
+print(loaded.model_dump())
+print(report_a.model_dump())
+print(report_b.model_dump())
+```
+
 ## Public API
+
+```python
+attestation.write(payload: dict) -> AttestationEnvelope
+attestation.read(record_id: str) -> AttestationEnvelope
+attestation.verify_chain(substrate: Literal["A", "B"], up_to_record_id: str | None = None) -> ChainVerificationReport
+```
+
+The concrete class is `AttestationStore`. `AttestationEnvelope` has the requested shape:
+
+```python
+record_id: str
+payload: dict
+anchor_a: AnchorRef
+anchor_b: AnchorRef
+chain_position_a: int
+chain_position_b: int
+server_recorded_at: datetime
+```
+
+`ChainVerificationReport` includes:
+
+- `valid`
+- `total_records_verified`
+- `break_position`
+- `break_record_id`
+- `recomputed_digest`
+- `stored_digest`
+- `reason`
+- `last_verified_record_id`
+
+## Two Independent Verification Substrates
+
+Every `write()` anchors the envelope to both substrates in one critical-path transaction. There is no public single-substrate write API.
+
+Substrate A:
+
+- table: `attestation_anchor_a`
+- payload digest: SHA-256 over canonical JSON
+- chain digest: SHA-256 over a canonical JSON structure tagged `substrate-a-v1`
+
+Substrate B:
+
+- table: `attestation_anchor_b`
+- payload digest: BLAKE2b over length-prefixed canonical JSON bytes
+- chain digest: BLAKE2b over length-prefixed binary fields tagged `substrate-b-v1`
+
+The substrates use different hash constructions, different storage tables, different payload-digest functions, and different anchor-digest functions. `read()` requires both chains to verify and also checks that the A and B anchors agree on record id, position, and server timestamp.
+
+## Hash Chain Semantics
+
+Each anchor includes the previous digest from the same logical chain:
+
+```text
+digest_n = H(substrate_domain, position_n, record_id_n, payload_digest_n, previous_digest_n, server_recorded_at_n)
+```
+
+Verification walks from genesis to the requested point and checks:
+
+- positions are contiguous
+- `previous_digest` equals the prior recomputed digest
+- the envelope row exists
+- the envelope payload recomputes to the stored payload digest
+- the stored anchor digest equals the recomputed anchor digest
+- A and B agree for `read(record_id)`
+
+This is the defense against forged insertion. A forged row with a locally correct content hash still fails unless it connects to the previous digest and all later chain links remain consistent.
+
+## Critical-Path Anchoring And Latency Bound
+
+`write()` is fail-closed:
+
+- it opens an SQLite `BEGIN IMMEDIATE` transaction
+- it writes the envelope, substrate A anchor, and substrate B anchor in the same transaction
+- it measures the critical-path duration
+- if the duration exceeds `max_write_latency_seconds`, it raises `WriteLatencyExceededError`
+- because the exception is raised inside the transaction, no envelope or single-substrate partial anchor propagates
+
+The named default latency bound is 1 second:
+
+```python
+AttestationStore(max_write_latency_seconds=1.0)
+```
+
+The test suite includes a synthetic bound-exceeded case that proves the write fails closed and leaves all three tables empty.
+
+## Server-Authoritative Time
+
+The provenance timestamp `server_recorded_at` is generated by the store's server-side clock inside the write transaction. Caller-supplied timestamps inside `payload` remain application data only and are not trusted as provenance metadata.
+
+The implementation has a private clock hook for deterministic tests. Production callers should use the default store clock and should treat `server_recorded_at` as library-owned provenance metadata.
+
+## Threat Model
+
+This library detects tampering that modifies previously stored envelopes or anchors, including raw SQL updates, forged insertions, deleted middle anchors, substrate-specific corruption, and A/B cross-substrate inconsistency. It assumes the verifier can read the SQLite database after the attempted tamper and that the attacker does not control the verification code at verification time. It does not assume caller-supplied timestamps are trustworthy. It does assume the local host clock and SQLite transaction semantics are acceptable for a local library threat model; stronger deployments should port the storage layer to Postgres and/or add external timestamp anchoring.
+
+## What This Does Not Provide
+
+This package does not provide external timestamp anchoring to a public log, HSM-backed signing, hardware attestation, Byzantine consensus, multi-region replication, or protection against an attacker who can rewrite the entire database and the verifier code together. It is tamper-evident, not tamper-proof. It makes normal API writes dual-anchored and makes post-hoc database tampering detectable by independent chain verification.
+
+## SQLite Backend And Postgres Port
+
+This implementation uses SQLite so the package can run from a clean checkout without external infrastructure. SQLite writes are serialized with `BEGIN IMMEDIATE` plus an in-process writer lock, which gives deterministic chain order for local threads and the included concurrent-writer test.
+
+For a production Postgres port, the concrete changes should be:
+
+- replace SQLite tables with Postgres tables using `BIGINT` positions, `JSONB` payloads, and unique constraints on `(position)` and `(record_id)` per substrate
+- use server-side `now()` / `clock_timestamp()` for `server_recorded_at`, not an application process clock
+- acquire a transaction-scoped advisory lock or lock a per-chain head row with `SELECT ... FOR UPDATE` before reading the previous digest
+- insert envelope + both anchors in one transaction under `READ COMMITTED` with the chain-head lock, or stricter isolation if multiple logical chains are added
+- use `RETURNING` to obtain authoritative timestamps and positions
+- keep the same verification logic, but push ordered scans and point lookups through Postgres indexes
+
+What weakens under SQLite multi-writer load: SQLite has database-level writer serialization and local locking behavior, not server-side row locks or advisory locks. It is adequate for local deterministic tests and low-write-volume single-node usage, but high-throughput multi-process writers should use Postgres so chain-head locking and server-authoritative timestamps live in the database engine.
+
+## Task B Adversarial Coverage
+
+The pytest suite includes mandatory adversarial cases:
+
+- raw backend `UPDATE` of an envelope payload is detected by chain verification
+- forged `INSERT` with a locally correct hash is detected by chain verification
+- deleted middle anchor is detected by chain verification
+- substrate A intact / B tampered makes `read()` raise
+- substrate B intact / A tampered makes `read()` raise
+- both chains individually valid but cross-substrate inconsistent makes `read()` raise
+- two concurrent writers produce a deterministic, verifiable order
+- latency bound exceeded makes `write()` fail closed with no partial rows
+- default 1-second bound holds at p99 across a small synthetic local write load
+- caller-supplied `server_recorded_at` inside payload is ignored as provenance metadata
+- no public single-substrate write API exists
+
+---
+
+# Task A: Prospective Simulation Harness
+
+## Quick Start
 
 ```python
 from datetime import timedelta
@@ -43,8 +200,6 @@ prediction_id = harness.register_prediction(
 )
 
 registered_at = harness.dao.get_prediction(prediction_id).registered_at
-# In real use, record the outcome when it is actually observed. This example
-# uses the test-friendly clock pattern only to show the API shape.
 harness.record_outcome(
     prediction_id=prediction_id,
     outcome={"label": 1},
@@ -58,17 +213,7 @@ report = harness.calibration_report(
 print(report.model_dump())
 ```
 
-The package also exposes the required module-level functions:
-
-```python
-from prospective_harness import register_prediction, record_outcome, calibration_report
-```
-
-Those functions lazily create a default SQLite database named `prospective_harness.sqlite3` in the current working directory. For tests or production code that need an explicit database path, prefer `ProspectiveHarness(sqlite_path=...)`.
-
-## Data Contract
-
-The assignment specifies `prediction: dict` and `outcome: dict`. Calibration metrics require a concrete binary probability contract, so this package uses:
+## Task A Data Contract
 
 ```python
 prediction = {"probability": 0.73}  # float in [0, 1]
@@ -77,7 +222,7 @@ outcome = {"label": 1}             # integer 0 or 1
 
 Invalid prediction or outcome payloads raise `ValueError`.
 
-## Prospective Registration Invariants
+## Task A Invariants
 
 `register_prediction(model_id, dataset_hash, prediction)` stores a new row with a SHA-256 content hash over:
 
@@ -92,41 +237,14 @@ registered_at < observed_at <= recorded_at
 recorded_at - observed_at <= max_recording_delay
 ```
 
-The default `max_recording_delay` is 5 minutes. This prevents the common backfill pattern of registering at `T0`, waiting until the real outcome is known, then claiming `observed_at = T0 + 1 second`. Callers that operate under a different trusted recording workflow can configure the delay explicitly:
+The default `max_recording_delay` is 5 minutes. Temporal violations raise `TemporalOrderingError`.
 
-```python
-from datetime import timedelta
-from prospective_harness import ProspectiveHarness
+## Task A Calibration Report
 
-harness = ProspectiveHarness(
-    sqlite_path="research.sqlite3",
-    max_recording_delay=timedelta(hours=3),
-)
-```
+`calibration_report(model_id, time_window)` filters predictions in SQL by `model_id` and registration time, then returns:
 
-Temporal violations raise `TemporalOrderingError`.
-
-## Append-Only Storage And Tamper Detection
-
-SQLite storage is append-only at both the DAO and database-trigger level:
-
-- The DAO exposes no prediction mutation method.
-- A unique outcome constraint prevents recording a second outcome for the same prediction.
-- SQLite triggers reject direct `UPDATE` and `DELETE` statements on `predictions` and `outcomes`.
-- Prediction hashes are recomputed on read; mismatches raise `DataIntegrityError`.
-
-This does not claim to provide cryptographic external timestamping. A stronger production system could add external notary timestamps or an append-only log service. Within the requested SQLite package, the implementation prevents normal API mutation, direct SQL rewrites, future-dated outcomes, and delayed backfilled outcome recording.
-
-## Calibration Report
-
-`calibration_report(model_id, time_window)` filters predictions in SQL by `model_id` and registration time, then returns a `CalibrationReport` with:
-
-- `number_registered`: predictions registered for the model inside the time window
-- `number_realized`: registered predictions that have outcomes
-- `calibration_curve`: exactly 10 bins: `[0.0,0.1)`, `[0.1,0.2)`, ..., `[0.9,1.0]`
-- `brier_score`: mean squared error over realized predictions, or `None` if there are no realized outcomes
-- `ece`: expected calibration error over realized predictions, or `None` if there are no realized outcomes
-
-## Storage Boundary
-
-`SQLitePredictionDAO` implements the DAO used by `ProspectiveHarness`. Business logic depends on the DAO protocol rather than SQLite-specific details, so another backend such as Postgres can be added by implementing the same methods.
+- `number_registered`
+- `number_realized`
+- `calibration_curve` with exactly 10 bins
+- `brier_score`
+- `ece`

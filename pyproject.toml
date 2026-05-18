@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prospective-harness"
-version = "0.1.1"
-description = "Prospective prediction registration and calibration harness"
+version = "0.2.0"
+description = "Prospective prediction and tamper-evident attestation harness"
 readme = "readme.md"
 requires-python = ">=3.11"
 dependencies = [
